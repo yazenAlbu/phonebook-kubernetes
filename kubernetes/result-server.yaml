@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: result-server
+  labels:
+    app: result-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: result-server
+  template:
+    metadata:
+      labels:
+        app: result-server
+    spec:
+      imagePullSecrets:
+        - name: phonebook-registry
+      containers:
+        - name: result-server
+          image: yazenalbu/phonebook:result-v1
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+          envFrom:
+            - configMapRef:
+                name: database-config
+          env:
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: MYSQL_PASSWORD
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: result-server
+spec:
+  selector:
+    app: result-server
+  type: NodePort
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+      nodePort: 30002
