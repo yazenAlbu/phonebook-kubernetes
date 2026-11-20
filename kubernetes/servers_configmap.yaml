@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: servers-config
+data:
+  SEARCH_URL: /search
+  MANAGEMENT_URL: /
+  DEVELOPER_NAME: Yazen Albu

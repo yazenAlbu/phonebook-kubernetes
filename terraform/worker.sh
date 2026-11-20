@@ -1,42 +1,79 @@
-#! /bin/bash
-apt-get update -y
-apt-get upgrade -y
+#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
 hostnamectl set-hostname kube-worker
-sudo apt-get install -y apt-transport-https ca-certificates curl gpg unzip
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
-apt-get update
-apt-get install -y kubelet kubeadm kubectl kubernetes-cni docker.io
+swapoff -a
+sed -i '/^[^#].*[[:space:]]swap[[:space:]]/ s/^/#/' /etc/fstab
+
+apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update
+apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 install -y ca-certificates curl gpg unzip ec2-instance-connect
+install -d -m 0755 /etc/apt/keyrings
+curl --retry 5 -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key -o /tmp/kubernetes-release.key
+gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes-release.key
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update
+apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 install -y kubelet kubeadm kubectl kubernetes-cni docker.io
 apt-mark hold kubelet kubeadm kubectl
-systemctl start docker
-systemctl enable docker
+systemctl enable --now docker
+systemctl enable kubelet
 usermod -aG docker ubuntu
-cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+
+cat > /etc/modules-load.d/k8s.conf <<'EOF'
 overlay
 br_netfilter
 EOF
 modprobe overlay
 modprobe br_netfilter
-cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
-net.bridge.bridge-nf-call-iptables  = 1
+
+cat > /etc/sysctl.d/k8s.conf <<'EOF'
+net.bridge.bridge-nf-call-iptables = 1
 net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward                 = 1
+net.ipv4.ip_forward = 1
 EOF
 sysctl --system
-mkdir /etc/containerd
-containerd config default | tee /etc/containerd/config.toml >/dev/null 2>&1
-sed -i 's/SystemdCgroup \= false/SystemdCgroup \= true/g' /etc/containerd/config.toml
+
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+systemctl enable --now containerd
 systemctl restart containerd
-systemctl enable containerd
-# install aws cli
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.0.30.zip" -o "awscliv2.zip"
-unzip awscliv2.zip
-./aws/install
-# Join the worker node
+
+curl --retry 5 -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install --update
+
 aws ec2 wait instance-status-ok --region ${region} --instance-ids ${master-id}
-ssh-keygen -t rsa -f /home/ubuntu/kube_key -q -N ""
-sleep 60
-aws ec2-instance-connect send-ssh-public-key --region ${region} --availability-zone ${master-zone} --instance-id ${master-id} --instance-os-user ubuntu --ssh-public-key file:///home/ubuntu/kube_key.pub && ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i /home/ubuntu/kube_key ubuntu@${master-private} 'until [ "$(kubectl get node | awk '\''/kube-master/ {print $2}'\'')" == "Ready" ]; do sleep 3; done'
-aws ec2-instance-connect send-ssh-public-key --region ${region} --availability-zone ${master-zone} --instance-id ${master-id} --instance-os-user ubuntu --ssh-public-key file:///home/ubuntu/kube_key.pub \
-&& eval "$(ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no  \
--i /home/ubuntu/kube_key ubuntu@${master-private} sudo kubeadm token create --print-join-command)"
+JOIN_DIRECTORY=$(mktemp -d /root/phonebook-join.XXXXXX)
+JOIN_KEY="$JOIN_DIRECTORY/id_rsa"
+trap 'rm -rf "$JOIN_DIRECTORY"' EXIT
+ssh-keygen -t rsa -b 3072 -f "$JOIN_KEY" -q -N ""
+
+join_command=""
+for attempt in $(seq 1 60); do
+  if aws ec2-instance-connect send-ssh-public-key \
+    --region ${region} \
+    --availability-zone ${master-zone} \
+    --instance-id ${master-id} \
+    --instance-os-user ubuntu \
+    --ssh-public-key "file://$JOIN_KEY.pub" > /dev/null; then
+    join_command=$(ssh \
+      -o ConnectTimeout=10 \
+      -o IdentitiesOnly=yes \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile="$JOIN_DIRECTORY/known_hosts" \
+      -i "$JOIN_KEY" ubuntu@${master-private} \
+      'sudo kubeadm token create --ttl 30m --print-join-command') || true
+    if [ -n "$join_command" ]; then
+      break
+    fi
+  fi
+  sleep 10
+done
+
+if [ -z "$join_command" ]; then
+  echo "Could not obtain the worker join command from the master."
+  exit 1
+fi
+
+bash -c "$join_command"
